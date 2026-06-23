@@ -1,8 +1,11 @@
-'use server';
+"use server";
 
-import { Conversation } from '@/app/types/ai';
-import { createAI } from './instance';
-import z from 'zod';
+import { Conversation } from "@/app/types/ai";
+import { createAI } from "./instance";
+import z from "zod";
+import { createClient } from "@/lib/supabase/server";
+import { generateEmbedding } from "./embedding";
+import { Transaction } from "@/app/types/transaction";
 
 export async function handleChat(
   conversation: Conversation[],
@@ -10,7 +13,7 @@ export async function handleChat(
 ) {
   const ai = createAI();
   const response = await ai.models.generateContent({
-    model: 'gemini-3.5-flash',
+    model: "gemini-3.5-flash",
     contents: [...conversation],
     config: {
       thinkingConfig: {
@@ -20,8 +23,8 @@ export async function handleChat(
   });
 
   const result = {
-    thought: '',
-    answer: '',
+    thought: "",
+    answer: "",
   };
 
   if (isThinking) {
@@ -45,13 +48,10 @@ export async function handleChat(
   return result;
 }
 
-export async function* handleChatStreaming(
-  conversation: Conversation[],
-  isThinking: boolean,
-) {
+async function generalChat(conversation: Conversation[], isThinking?: boolean) {
   const ai = createAI();
   const response = await ai.models.generateContentStream({
-    model: 'gemini-3.5-flash',
+    model: "gemini-3.5-flash",
     contents: [...conversation],
     config: {
       thinkingConfig: {
@@ -114,12 +114,105 @@ export async function* handleChatStreaming(
       topP: 0.1,
       // output control
       maxOutputTokens: 2048,
-      stopSequences: ['\n\n\n', '###', 'User:', 'Pengguna:'],
+      stopSequences: ["\n\n\n", "###", "User:", "Pengguna:"],
       // repetition penalties
       // presencePenalty: 1.5,
       // frequencyPenalty: 1.5,
     },
   });
+
+  return response;
+}
+
+async function personalizedChat(
+  query: string,
+  historyChat?: Conversation[],
+  isThinking?: boolean,
+) {
+  const ai = createAI();
+
+  const supabase = await createClient();
+
+  const queryEmbedding = await generateEmbedding(query);
+
+  const { data, error } = await supabase.rpc("match_transactions", {
+    query_embedding: queryEmbedding,
+    match_threshold: 0.3,
+    match_count: 15,
+  });
+
+  if (error) {
+    throw new Error("Failed to perform vector search.");
+  }
+
+  let contextData = "";
+
+  if (!data || data.length === 0) {
+    contextData =
+      "No transactions found that are similar or relevant to the question";
+  } else {
+    contextData = data
+      .map((transaction: Transaction) => {
+        return JSON.stringify(transaction);
+      })
+      .join("\n");
+  }
+
+  const prompt = `
+    <role>
+      You are an AI Financial Analyst. You are helping the user analyze 
+      their financial data using the RAG (Retrieval-Augmented Generation) technique.
+    </role>
+    <input>
+      User Question: "${query}"
+    </input>
+    <context>
+      Relevant Transaction data from the database (Ordered from most relevant):
+      ${contextData}
+    </context>
+    <instruction>
+      - Answer the user question ONLY based on the relevant transaction data above.
+      - If there are calculations (total spending, average, etc), calculate them accurately based on the data.
+      - Provide the answer in a neat, professional, yet easy-to-understand markdown format.
+      - If there is no relevant data at all, state that the data is not availble in the history.
+      - If user question is general and not need a data, response generally.
+    </instruction>
+    <constraints>
+      - Don't answer in table format instead of markdown.
+    </contraints>
+  `;
+
+  const response = await ai.models.generateContentStream({
+    model: "gemini-3.5-flash",
+    contents: [
+      ...(historyChat ?? []),
+      { role: "user", parts: [{ text: prompt }] },
+    ],
+    config: {
+      thinkingConfig: {
+        includeThoughts: isThinking,
+      },
+    },
+  });
+
+  return response;
+}
+
+export async function* handleChatStreaming(
+  conversation: Conversation[],
+  isThinking: boolean,
+  mode: "general" | "personal",
+) {
+  let response;
+  if (mode === "general") {
+    response = await generalChat(conversation, isThinking);
+  } else {
+    response = await personalizedChat(
+      conversation[conversation.length - 1].parts[0].text,
+      conversation.slice(0, -1),
+      isThinking,
+    );
+  }
 
   if (isThinking) {
     for await (const chunk of response) {
@@ -146,21 +239,21 @@ export async function* handleChatStreaming(
 }
 
 const transactionSchema = z.object({
-  amount: z.number().default(0).describe('Transaction nominal'),
-  type: z.enum(['income', 'expense']).describe('Type of transaction'),
+  amount: z.number().default(0).describe("Transaction nominal"),
+  type: z.enum(["income", "expense"]).describe("Type of transaction"),
   category: z
     .enum([
-      'Food & Drink',
-      'Shopping',
-      'Housing',
-      'Transportation',
-      'Entertainment',
-      'Salary',
-      'Others',
+      "Food & Drink",
+      "Shopping",
+      "Housing",
+      "Transportation",
+      "Entertainment",
+      "Salary",
+      "Others",
     ])
-    .describe('Category of transaction'),
-  description: z.string().describe('Short text for describing transaction'),
-  date: z.string().describe('the date of transaction in YYYY-MM-DD format'),
+    .describe("Category of transaction"),
+  description: z.string().describe("Short text for describing transaction"),
+  date: z.string().describe("the date of transaction in YYYY-MM-DD format"),
 });
 
 export async function handleWizardInput(message: string) {
@@ -191,17 +284,17 @@ export async function handleWizardInput(message: string) {
   `;
   const ai = createAI();
   const response = await ai.models.generateContent({
-    model: 'gemini-3.5-flash',
+    model: "gemini-3.5-flash",
     contents,
     config: {
-      responseMimeType: 'application/json',
+      responseMimeType: "application/json",
       responseSchema: z.toJSONSchema(transactionSchema),
     },
   });
 
   const transaction = transactionSchema.parse(JSON.parse(`${response.text}`));
   if (transaction.amount <= 0) {
-    throw new Error('Cannot create transaction with invalid amount');
+    throw new Error("Cannot create transaction with invalid amount");
   }
 
   return transaction;
