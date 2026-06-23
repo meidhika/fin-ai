@@ -1,7 +1,8 @@
-"use server";
+'use server';
 
-import { Conversation } from "@/app/types/ai";
-import { createAI } from "./instance";
+import { Conversation } from '@/app/types/ai';
+import { createAI } from './instance';
+import z from 'zod';
 
 export async function handleChat(
   conversation: Conversation[],
@@ -9,7 +10,7 @@ export async function handleChat(
 ) {
   const ai = createAI();
   const response = await ai.models.generateContent({
-    model: "gemini-3.5-flash",
+    model: 'gemini-3.5-flash',
     contents: [...conversation],
     config: {
       thinkingConfig: {
@@ -19,8 +20,8 @@ export async function handleChat(
   });
 
   const result = {
-    thought: "",
-    answer: "",
+    thought: '',
+    answer: '',
   };
 
   if (isThinking) {
@@ -50,7 +51,7 @@ export async function* handleChatStreaming(
 ) {
   const ai = createAI();
   const response = await ai.models.generateContentStream({
-    model: "gemini-3.5-flash",
+    model: 'gemini-3.5-flash',
     contents: [...conversation],
     config: {
       thinkingConfig: {
@@ -113,7 +114,7 @@ export async function* handleChatStreaming(
       topP: 0.1,
       // output control
       maxOutputTokens: 2048,
-      stopSequences: ["\n\n\n", "###", "User:", "Pengguna:"],
+      stopSequences: ['\n\n\n', '###', 'User:', 'Pengguna:'],
       // repetition penalties
       // presencePenalty: 1.5,
       // frequencyPenalty: 1.5,
@@ -144,14 +145,64 @@ export async function* handleChatStreaming(
   }
 }
 
+const transactionSchema = z.object({
+  amount: z.number().default(0).describe('Transaction nominal'),
+  type: z.enum(['income', 'expense']).describe('Type of transaction'),
+  category: z
+    .enum([
+      'Food & Drink',
+      'Shopping',
+      'Housing',
+      'Transportation',
+      'Entertainment',
+      'Salary',
+      'Others',
+    ])
+    .describe('Category of transaction'),
+  description: z.string().describe('Short text for describing transaction'),
+  date: z.string().describe('the date of transaction in YYYY-MM-DD format'),
+});
+
 export async function handleWizardInput(message: string) {
-  const contents = `${message}`;
+  const contents = `
+  <role>
+    You are an AI Wizard finance assitant, who can extract transaction details from text.
+  </role>
+  <instruction>
+    Extract the transaction details from the following text and return it as a structure JSON object.
+    The JSON object must have exactly these fields:
+    - "amount": a number representing the cost (positive). Use 0 if not provided.
+    - "type": type of transaction, either 'income' or 'expense'.
+    - "category": choose the most appropriate category from this exact list:
+                  'Food & Drink','Shopping','Housing','Transportation','Entertainment','Salary','Others'.
+    - "description": a short string describing the transaction, first letter capitalized.
+    - "date": date of transaction in YYYY-MM-DD format.
+              Assume the current date if relative terms like 'today' or 'just now'. If not define use current date.
+  </instruction>
+  <context>
+    Current Date : ${new Date().toISOString()}
+  </context>
+  <input>
+    Text to extract: ${message}
+  </input>
+  <outputFormat>
+    Respond with only the raw JSON object, no markdown blocks, no text before or after.
+  </outputFormat>
+  `;
   const ai = createAI();
   const response = await ai.models.generateContent({
-    model: "gemini-3.5-flash",
+    model: 'gemini-3.5-flash',
     contents,
-    config: {},
+    config: {
+      responseMimeType: 'application/json',
+      responseSchema: z.toJSONSchema(transactionSchema),
+    },
   });
 
-  return response.text;
+  const transaction = transactionSchema.parse(JSON.parse(`${response.text}`));
+  if (transaction.amount <= 0) {
+    throw new Error('Cannot create transaction with invalid amount');
+  }
+
+  return transaction;
 }
